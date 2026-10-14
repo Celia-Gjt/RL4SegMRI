@@ -1,6 +1,6 @@
 # RL4SegMRI
 
-RL4Seg is a reinforcement learning framework for domain adaptation of cardiac MRI segmentation.
+RL4SegMRI is a reinforcement learning framework for domain adaptation of cardiac MRI segmentation.
 
 Key elements of RL are defined as follows:
 - State (s): input image
