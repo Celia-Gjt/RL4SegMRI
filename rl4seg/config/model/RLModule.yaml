@@ -1,6 +1,5 @@
 defaults:
   - /reward: rewardunet
-  - /corrector: ae
 
 actor_save_path: null
 critic_save_path: null

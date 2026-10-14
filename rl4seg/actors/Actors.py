@@ -43,6 +43,7 @@ class UnetActorCategorical(nn.Module):
         super().__init__()
         self.net = UNet(input_shape=input_shape, output_shape=output_shape)
         self.old_net = UNet(input_shape=input_shape, output_shape=output_shape)
+        self.output_shape = output_shape
 
         if pretrain_ckpt:
             # if starting from pretrained model, keep version of

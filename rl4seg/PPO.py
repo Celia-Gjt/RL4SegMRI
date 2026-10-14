@@ -67,6 +67,8 @@ class PPO(RLmodule):
             logs = {**metrics_dict,
                     **{'loss': loss,
                        'critic_loss': critic_loss,
+                       'reward': metrics_dict['reward'], 
+                       'ratio': metrics_dict['ratio']
                        }
                     }
 
@@ -111,15 +113,19 @@ class PPO(RLmodule):
         # Critic loss
         if b_rewards.shape != v.shape:  # if critic is resnet, use reward mean instead of pixel-wise
             b_rewards = b_rewards.mean(dim=(1, 2), keepdim=True)
-        critic_loss = nn.MSELoss()(v, b_rewards)
+        critic_loss = nn.BCELoss()(v, b_rewards)
 
         # metrics dict
         metrics = {
                 'v': v.mean(),
                 'advantage': adv.mean(),
+                'advantage_std': adv.std(),
+                'frac_adv_significant': (adv.abs() > 0.1).float().mean(),
                 'reward': b_rewards.mean(),
                 'log_probs': log_probs.mean(),
                 'ratio': ratio.mean(),
+                'clip_frac': ((ratio - 1).abs() > self.clip_value).float().mean().detach(),
+                'kl_ref': log_pi_ratio.mean().detach(),
                 'approx_kl_div': log_pi_ratio.mean(),
         }
 

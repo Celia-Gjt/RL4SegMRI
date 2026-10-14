@@ -5,13 +5,12 @@ from typing import Dict
 import pytorch_lightning as pl
 import torch
 from torch import nn, optim
-from torch.nn import functional as F
+
+from rl4seg.utils.loss_functions import DC_and_BCE_loss
 from vital.models.segmentation.unet import UNet
 
-from rl4seg.utils.Metrics import accuracy
-from rl4seg.utils.logging_helper import log_image
-
-import torch.distributions as distributions
+from rl4seg.utils.Metrics import accuracy, error_recall
+from rl4seg.utils.logging_helper import log_image, log_case
 
 
 class RewardOptimizer(pl.LightningModule):
@@ -60,16 +59,20 @@ class RewardOptimizer(pl.LightningModule):
         loss = self.loss(y_pred, y)
 
         acc = accuracy(y_pred, x, y)
+        rec = error_recall(y_pred, y)
 
         self.log_dict({"val_loss": loss,
-                       "val_acc": acc.mean()})
+                       "val_acc": acc.mean(),
+                       'val_rec': rec.mean()})
 
         # log images
         idx = random.randint(0, len(x) - 1)  # which image to log
-        log_image(self.logger, img=x[idx].permute((0, 2, 1)), title='Image', number=batch_idx)
-        log_image(self.logger, img=y[idx].permute((0, 2, 1)), title='GroundTruth', number=batch_idx)
-        log_image(self.logger, img=y_pred[idx].permute((0, 2, 1)), title='Prediction', number=batch_idx,
-                  img_text=acc[idx].mean())
+        im_show = x[idx, :1].permute((0, 2, 1)).detach().cpu().numpy()
+        input_show = x[idx, 1:].permute((0, 2, 1)).detach().cpu().numpy()
+        gt_show = y[idx].permute((0, 2, 1)).detach().cpu().numpy()
+        pred_show = y_pred[idx].permute((0, 2, 1)).detach().cpu().numpy()
+        log_case(self.logger, img=[im_show,input_show,gt_show,pred_show], title='Figure_reward', number=self.global_step,
+                  img_text=rec[idx].mean())
 
         return {'loss': loss}
 
@@ -80,15 +83,19 @@ class RewardOptimizer(pl.LightningModule):
         loss = self.loss(y_pred, y)
 
         acc = accuracy(y_pred, x, y)
+        rec = error_recall(y_pred, y)
 
         self.log_dict({"test_loss": loss,
-                       "test_acc": acc.mean()})
+                       "test_acc": acc.mean(),
+                       'test_rec': rec.mean()})
 
         for i in range(len(x)):
-            log_image(self.logger, img=x[i].permute((0, 2, 1)), title='test_Image', number=batch_idx * (i + 1))
-            log_image(self.logger, img=y[i].permute((0, 2, 1)), title='test_GroundTruth', number=batch_idx * (i + 1))
-            log_image(self.logger, img=y_pred[i].permute((0, 2, 1)), title='test_Prediction', number=batch_idx * (i + 1),
-                      img_text=acc[i].mean())
+            im_show = x[i, :1].permute((0, 2, 1)).detach().cpu().numpy()
+            input_show = x[i, 1:].permute((0, 2, 1)).detach().cpu().numpy()
+            gt_show = y[i].permute((0, 2, 1)).detach().cpu().numpy()
+            pred_show = y_pred[i].permute((0, 2, 1)).detach().cpu().numpy()
+            log_case(self.logger, img=[im_show,input_show,gt_show,pred_show], title='test_Figure_reward', number=batch_idx * (i + 1),
+                      img_text=rec[i].mean())
 
         return {'loss': loss}
 

@@ -2,14 +2,19 @@ work_dir: ${hydra:runtime.cwd}
 run_name: default
 
 defaults:
-  - logger: tensorboard
+  - logger: comet
   - model: ppo
   - datamodule: ???
   - callbacks: default
   - _self_
-  - experiment: ppo_es_ed
+  - experiment: ppo_pepr_cine
 
 seed: 1
+
+callbacks:
+  model_checkpoint:
+    monitor: val_anat_valid
+    mode: max
 
 datamodule:
  gt_column: Gt_0

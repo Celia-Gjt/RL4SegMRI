@@ -1,7 +1,6 @@
 import copy
 import random
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import h5py
@@ -12,12 +11,14 @@ import torch
 from scipy import ndimage
 from torchvision.transforms.functional import adjust_contrast
 from torch import Tensor
-from vital.metrics.camus.anatomical.utils import check_segmentation_validity
-from vital.data.camus.config import Label
+from rl4seg.anatomical_metrics import check_segmentation_validity as check_segmentation_validity_mri
+from rl4seg.utils.deformation_helper import punch_hole_in_structure, remove_rv, punch_hole_at_interface, \
+    sample_deformation_size, erode_structure, dilate_structure, shift_interface
+from vital.data.pepr.config import Label
 
-from utils.Metrics import accuracy, dice_score, is_anatomically_valid
+from utils.Metrics import accuracy, dice_score, is_anatomically_valid_mri, error_recall
 from utils.file_utils import get_img_subpath, save_to_reward_dataset
-from utils.logging_helper import log_image
+from utils.logging_helper import log_image, log_case
 from utils.tensor_utils import convert_to_numpy
 from utils.test_metrics import dice, hausdorff
 
@@ -43,6 +44,8 @@ class RLmodule(pl.LightningModule):
                  critic_save_path=None,
                  save_uncertainty_path=None,
                  predict_save_dir=None,
+                 predict_do_hole_degrad=True,
+                 predict_do_shape_deform=True,
                  predict_do_swap_img=True,
                  predict_do_model_perturb=True,
                  predict_do_img_perturb=True,
@@ -63,10 +66,14 @@ class RLmodule(pl.LightningModule):
         self.predict_save_dir = predict_save_dir
         self.pred_corrector = corrector
 
+        self.predict_do_hole_degrad = predict_do_hole_degrad
+        self.predict_do_shape_deform = predict_do_shape_deform
         self.predict_do_swap_img = predict_do_swap_img
         self.predict_do_model_perturb = predict_do_model_perturb
         self.predict_do_img_perturb = predict_do_img_perturb
         self.predict_do_corrections = predict_do_corrections
+
+        self.invalid_segmentation_bank = {}
 
     def configure_optimizers(self):
         return self.actor.get_optimizers()
@@ -131,30 +138,39 @@ class RLmodule(pl.LightningModule):
         Returns:
             Dict of logs
         """
-        b_img, b_gt, b_use_gt = batch['img'], batch['gt'], batch['use_gt']
+        b_img, b_gt, b_use_gt, voxel_spacing, is_base = batch['img'], batch['gt'], batch['use_gt'], batch['vox'], batch[
+            'is_base']
 
-        prev_actions, prev_log_probs, prev_rewards = self.rollout(b_img, b_gt)
+        prev_actions, prev_log_probs, prev_rewards = self.rollout(b_img, b_gt, sample=False)
 
         loss, critic_loss, metrics_dict = self.compute_policy_loss((b_img, prev_actions, prev_rewards,
                                                                     prev_log_probs, b_gt, b_use_gt))
 
         acc = accuracy(prev_actions, b_img, b_gt)
-        dice = dice_score(prev_actions, b_gt)
+        dice = dice_score(prev_actions, b_gt, self.actor.actor.output_shape[0])
+        anat_errors = is_anatomically_valid_mri(prev_actions, voxel_spacing, is_base)
 
         logs = {'val_loss': loss,
                 "val_reward": torch.mean(prev_rewards.type(torch.float)),
                 "val_acc": acc.mean(),
-                "val_dice": dice.mean()
+                "val_dice": dice.mean(),
+                "val_anat_valid": anat_errors.mean(),
                 }
 
         # log images
         idx = random.randint(0, len(b_img) - 1)  # which image to log
-        log_image(self.logger, img=b_img[idx].permute((0, 2, 1)), title='Image', number=batch_idx)
-        log_image(self.logger, img=b_gt[idx].unsqueeze(0).permute((0, 2, 1)), title='GroundTruth', number=batch_idx)
-        log_image(self.logger, img=prev_actions[idx].unsqueeze(0).permute((0, 2, 1)), title='Prediction', number=batch_idx,
-                  img_text=prev_rewards[idx].mean())
+        im_show = b_img[idx].permute((0, 2, 1)).detach().cpu().numpy()
+        gt_show = b_gt[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+        pred_show = prev_actions[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
         if prev_rewards.shape == prev_actions.shape:
-            log_image(self.logger, img=prev_rewards[idx].unsqueeze(0).permute((0, 2, 1)), title='RewardMap', number=batch_idx)
+            reward_show = prev_rewards[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+            # log_image(self.logger, img=reward_show, title='RewardMap_RL', number=self.global_step)
+            log_case(self.logger, img=[im_show, gt_show, pred_show, reward_show], title='Figure_RL',
+                     number=self.global_step,
+                     img_text=prev_rewards[idx].mean())
+        else:
+            log_case(self.logger, img=[im_show, gt_show, pred_show], title='Figure_RL', number=self.global_step,
+                     img_text=prev_rewards[idx].mean())
 
         self.log_dict(logs)
         return logs
@@ -171,18 +187,23 @@ class RLmodule(pl.LightningModule):
         Returns:
             Dict of logs
         """
-        b_img, b_gt, voxel_spacing = batch['img'], batch['gt'], batch['vox']
+        b_img, b_gt, voxel_spacing, is_base = batch['img'], batch['gt'], batch['vox'], batch['is_base']
 
         prev_actions, prev_log_probs, prev_rewards = self.rollout(b_img, b_gt, sample=False)
         loss, critic_loss, metrics_dict = self.compute_policy_loss((b_img, prev_actions, prev_rewards,
                                                                     prev_log_probs, b_gt, False))
         acc = accuracy(prev_actions, b_img, b_gt)
-        simple_dice = dice_score(prev_actions, b_gt)
+        simple_dice = dice_score(prev_actions, b_gt, self.actor.actor.output_shape[0])
         y_pred_np = prev_actions.cpu().numpy()
         b_gt_np = b_gt.cpu().numpy()
 
         for i in range(len(y_pred_np)):
             lbl, num = ndimage.measurements.label(y_pred_np[i] != 0)
+
+            # No foreground predicted
+            if num == 0:
+                continue
+
             # Count the number of elements per label
             count = np.bincount(lbl.flat)
             # Select the largest blob
@@ -190,25 +211,19 @@ class RLmodule(pl.LightningModule):
             # Remove the other blobs
             y_pred_np[i][lbl != maxi] = 0
 
-        test_dice = dice(y_pred_np, b_gt_np, labels=(Label.BG, Label.LV, Label.MYO),
+        test_dice = dice(y_pred_np, b_gt_np, labels=(Label.BG, Label.LV, Label.MYO, Label.RV),
                          exclude_bg=True, all_classes=True)
-        test_dice_epi = dice((y_pred_np != 0).astype(np.uint8), (b_gt_np != 0).astype(np.uint8),
-                             labels=(Label.BG, Label.LV), exclude_bg=True, all_classes=False)
 
-        test_hd = hausdorff(y_pred_np, b_gt_np, labels=(Label.BG, Label.LV, Label.MYO),
+        test_hd = hausdorff(y_pred_np, b_gt_np, labels=(Label.BG, Label.LV, Label.MYO, Label.RV),
                             exclude_bg=True, all_classes=True, voxel_spacing=voxel_spacing.cpu().numpy())
-        test_hd_epi = hausdorff((y_pred_np != 0).astype(np.uint8), (b_gt_np != 0).astype(np.uint8),
-                                labels=(Label.BG, Label.LV), exclude_bg=True, all_classes=False,
-                                voxel_spacing=voxel_spacing.cpu().numpy())['Hausdorff']
-        anat_errors = is_anatomically_valid(y_pred_np)
+
+        anat_errors = is_anatomically_valid_mri(y_pred_np, voxel_spacing, is_base)
 
         logs = {'test_loss': loss,
+                "test_anat_valid": anat_errors.mean(),
                 "test_reward": torch.mean(prev_rewards.type(torch.float)),
                 'test_acc': acc.mean(),
                 "test_dice": simple_dice.mean(),
-                "test_anat_valid": anat_errors.mean(),
-                'dice_epi': test_dice_epi,
-                'hd_epi': test_hd_epi,
                 }
         logs.update(test_dice)
         logs.update(test_hd)
@@ -217,16 +232,34 @@ class RLmodule(pl.LightningModule):
         _, _, _, _, v, _ = self.actor.evaluate(b_img, prev_actions)
 
         for i in range(len(b_img)):
-            log_image(self.logger, img=b_img[i].permute((0, 2, 1)), title='test_Image', number=batch_idx * (i + 1))
-            log_image(self.logger, img=b_gt[i].unsqueeze(0).permute((0, 2, 1)), title='test_GroundTruth', number=batch_idx * (i + 1))
-            log_image(self.logger, img=prev_actions[i].unsqueeze(0).permute((0, 2, 1)), title='test_Prediction', number=batch_idx * (i + 1),
-                      img_text=simple_dice[i].mean())
+
+            im_show = b_img[i].permute((0, 2, 1)).detach().cpu().numpy()
+            gt_show = b_gt[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+            pred_show = prev_actions[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+
             if v.shape == prev_actions.shape:
-                log_image(self.logger, img=v[i].unsqueeze(0).permute((0, 2, 1)), title='test_v_function', number=batch_idx * (i + 1),
-                          img_text=v[i].mean())
-            if prev_rewards.shape == prev_actions.shape:
-                log_image(self.logger, img=prev_rewards[i].unsqueeze(0).permute((0, 2, 1)), title='test_RewardMap', number=batch_idx * (i + 1),
-                          img_text=prev_rewards[i].mean())
+                v_show = v[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+                # log_image(self.logger, img=v_show, title='test_v_function_RL', number=batch_idx * (i + 1), img_text=v[i].mean())
+                if prev_rewards.shape == prev_actions.shape:
+                    reward_show = prev_rewards[i].unsqueeze(0).permute((0, 2, 1))
+                    # log_image(self.logger, img=reward_show, title='test_RewardMap_RL', number=batch_idx * (i + 1), img_text=prev_rewards[i].mean())
+                    log_case(self.logger, img=[im_show, gt_show, pred_show, reward_show, v_show],
+                             title='test_Figure_RL', number=batch_idx * (i + 1),
+                             img_text=f"{prev_rewards[i].mean()} et {v[i].mean()}")
+                else:
+                    log_case(self.logger, img=[im_show, gt_show, pred_show, v_show], title='test_Figure_RL',
+                             number=batch_idx * (i + 1),
+                             img_text=v[i].mean())
+            else:
+                if prev_rewards.shape == prev_actions.shape:
+                    reward_show = prev_rewards[i].unsqueeze(0).permute((0, 2, 1))
+                    # log_image(self.logger, img=reward_show, title='test_RewardMap_RL', number=batch_idx * (i + 1), img_text=prev_rewards[i].mean())
+                    log_case(self.logger, img=[im_show, gt_show, pred_show, reward_show], title='test_Figure_RL',
+                             number=batch_idx * (i + 1),
+                             img_text=prev_rewards[i].mean())
+                else:
+                    log_case(self.logger, img=[im_show, gt_show, pred_show], title='test_Figure_RL',
+                             number=batch_idx * (i + 1))
 
         self.log_dict(logs)
 
@@ -247,205 +280,467 @@ class RLmodule(pl.LightningModule):
     def on_test_end(self) -> None:
         if self.actor_save_path:
             torch.save(self.actor.actor.net.state_dict(), self.actor_save_path)
-
-            actor_net = shrink_perturb(copy.deepcopy(self.actor.actor.net))
-            torch.save(actor_net.state_dict(), self.actor_save_path.replace('.ckpt', '_s-p.ckpt'))
         if self.critic_save_path:
             torch.save(self.actor.critic.net.state_dict(), self.critic_save_path)
-            critic_net = shrink_perturb(copy.deepcopy(self.actor.critic.net))
-            torch.save(critic_net.state_dict(), self.critic_save_path.replace('.ckpt', '_s-p.ckpt'))
 
     def predict_step(self, batch: dict[str, Tensor], batch_idx: int, dataloader_idx: int = 0) -> Any:
-        b_img, ids, inst = batch['img'], batch['id'], batch.get('instant', None)
+        b_img, ids, inst, slice, voxelspacing, is_base = batch['img'], batch['id'], batch['instant'], batch['slice'], \
+            batch['vox'], batch['is_base']
 
         actions, _, _ = self.rollout(b_img, torch.zeros_like(b_img).squeeze(1), sample=True)
         actions_unsampled, _, _ = self.rollout(b_img, torch.zeros_like(b_img).squeeze(1), sample=False)
 
-        corrected, corrected_validity, ae_comp = self.pred_corrector.correct_batch(b_img, actions_unsampled)
+        if self.pred_corrector is not None:
+            corrected, corrected_validity, ae_comp = self.pred_corrector.correct_batch(b_img, actions_unsampled)
 
         initial_params = copy.deepcopy(self.actor.actor.net.state_dict())
         itr = 0
 
         for i in range(len(b_img)):
-            self.trainer.datamodule.add_to_train(ids[i], inst[i] if inst else None)
-            if ae_comp[i] > 0.95 and check_segmentation_validity(actions_unsampled[i].cpu().numpy().T, (1.0, 1.0),
-                                                                 [0, 1, 2]):
-                self.trainer.datamodule.add_to_gt(ids[i], inst[i] if inst else None)
+            valid, _ = check_segmentation_validity_mri(
+                actions_unsampled[i].cpu().numpy(), voxelspacing[i].cpu().numpy(), is_base[i].cpu().numpy()
+            )
+            # self.trainer.datamodule.add_to_train(ids[i], inst[i], slice[i])
+            if ((self.pred_corrector is None) or ae_comp[i] > 0.95):
+                if valid:
+                    """self.trainer.datamodule.add_to_gt(ids[i], inst[i], slice[i])
+    
+                    path = self.trainer.datamodule.get_approx_gt_subpath(ids[i], inst[i], slice[i])
+                    approx_gt_path = self.trainer.datamodule.hparams.approx_gt_dir + '/approx_gt/' + path
+                    Path(approx_gt_path).parent.mkdir(parents=True, exist_ok=True)
+                    hdr = nib.Nifti1Header()
+                    nifti = nib.Nifti1Image(torch.round(actions_unsampled[i]).cpu().numpy(), np.diag(np.asarray([-1, -1, 1, 0])), hdr)
+                    nifti.to_filename(approx_gt_path)"""
 
-                path = self.trainer.datamodule.get_approx_gt_subpath(ids[i], inst[i] if inst else None)
-                approx_gt_path = self.trainer.datamodule.hparams.approx_gt_dir + '/approx_gt/' + path
-                Path(approx_gt_path).parent.mkdir(parents=True, exist_ok=True)
-                hdr = nib.Nifti1Header()
-                nifti = nib.Nifti1Image(torch.round(actions_unsampled[i]).cpu().numpy(), np.diag(np.asarray([-1, -1, 1, 0])), hdr)
-                nifti.to_filename(approx_gt_path)
+                    if self.predict_do_hole_degrad:
 
-                if self.predict_do_swap_img:
-                    # force actions to resemble image?
-                    filename = f"{batch_idx}_{itr}_{i}_wrong_s_{int(round(datetime.now().timestamp()))}.nii.gz"
-                    save_to_reward_dataset(self.predict_save_dir,
-                                           filename,
-                                           convert_to_numpy(b_img[i]),
-                                           np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
-                                           np.expand_dims(convert_to_numpy(actions[random.randint(0, len(b_img)-1)]), 0))
-                if self.predict_do_model_perturb:
-                    for j, multiplier in enumerate([0.005, 0.01, 0.015, 0.02]):
-                        # get random seed based on time to maximise randomness of noise and subsequent predictions
-                        # explore as much space around policy as possible
-                        time_seed = int(round(datetime.now().timestamp())) + i
-                        torch.manual_seed(time_seed)
+                        action_np = convert_to_numpy(
+                            actions_unsampled[i]
+                        )
 
-                        # load initial params so noise is not compounded
+                        deformation_types = [
+                            "myo_hole",
+                            "rv_hole",
+                            "lv_hole",
+                            "no_rv",
+                            "lv_myo_interface",
+                            "rv_myo_interface",
+                        ]
+
+                        for degrad_type in deformation_types:
+
+                            # 1 chance sur 5
+                            if random.random() >= 1 / 5:
+                                continue
+
+                            n_holes = random.choices(
+                                [1, 2, 3],
+                                weights=[0.65, 0.25, 0.10],
+                                k=1,
+                            )[0]
+
+                            degraded_action = action_np.copy()
+
+                            # ---------------------------------------------------------
+                            # Internal holes
+                            # ---------------------------------------------------------
+
+                            if degrad_type == "myo_hole":
+
+                                degraded_action = punch_hole_in_structure(
+                                    action_np,
+                                    target_label=Label.MYO,
+                                    hole_radius_range=(1, 5),
+                                    num_holes=n_holes,
+                                    min_boundary_distance=2,
+                                )
+
+                            elif degrad_type == "rv_hole":
+
+                                degraded_action = punch_hole_in_structure(
+                                    action_np,
+                                    target_label=Label.RV,
+                                    hole_radius_range=(1, 4),
+                                    num_holes=n_holes,
+                                    min_boundary_distance=1,
+                                )
+
+                            elif degrad_type == "lv_hole":
+
+                                degraded_action = punch_hole_in_structure(
+                                    action_np,
+                                    target_label=Label.LV,
+                                    hole_radius_range=(1, 4),
+                                    num_holes=n_holes,
+                                    min_boundary_distance=1,
+                                )
+
+                            # ---------------------------------------------------------
+                            # Missing RV
+                            # ---------------------------------------------------------
+
+                            elif degrad_type == "no_rv":
+
+                                degraded_action = remove_rv(
+                                    action_np,
+                                    replacement_label=Label.BG,
+                                    fraction_range=(0.2, 1),
+                                )
+
+                            # ---------------------------------------------------------
+                            # Interfaces
+                            # ---------------------------------------------------------
+
+                            elif degrad_type == "lv_myo_interface":
+
+                                degraded_action = punch_hole_at_interface(
+                                    action_np,
+                                    Label.LV,
+                                    Label.MYO,
+                                    hole_radius_range=(1, 3),
+                                    num_holes=n_holes,
+                                )
+
+                            elif degrad_type == "rv_myo_interface":
+
+                                degraded_action = punch_hole_at_interface(
+                                    action_np,
+                                    Label.RV,
+                                    Label.MYO,
+                                    hole_radius_range=(1, 3),
+                                    num_holes=n_holes,
+                                )
+
+                            # ---------------------------------------------------------
+                            # Save
+                            # ---------------------------------------------------------
+
+                            if not np.array_equal(
+                                    degraded_action,
+                                    action_np,
+                            ):
+                                filename = (
+                                    f"{batch_idx}_{itr}_{i}_"
+                                    f"{degrad_type}_"
+                                    f"{int(round(datetime.now().timestamp()))}.nii.gz"
+                                )
+
+                                save_to_reward_dataset(
+                                    self.predict_save_dir,
+                                    filename,
+                                    convert_to_numpy(b_img[i]),
+                                    np.expand_dims(action_np, 0),
+                                    np.expand_dims(degraded_action, 0),
+                                    voxelspacing[i].cpu().numpy(),
+                                )
+
+                    """
+                    if self.predict_do_swap_img:
+
+                        slice_id = int(slice[i])
+
+                        candidates = self.invalid_segmentation_bank.get(slice_id, [])
+
+                        if len(candidates) > 0:
+                            candidate = random.choice(candidates)
+
+                            wrong_action = candidate["action"]
+
+                            filename = (
+                                f"{batch_idx}_{itr}_{i}_wrong_s_"
+                                f"{int(round(datetime.now().timestamp()))}.nii.gz"
+                            )
+
+                            save_to_reward_dataset(
+                                self.predict_save_dir,
+                                filename,
+                                convert_to_numpy(b_img[i]),
+                                np.expand_dims(
+                                    convert_to_numpy(actions_unsampled[i]),
+                                    0
+                                ),
+                                np.expand_dims(
+                                    wrong_action,
+                                    0
+                                ),
+                                voxelspacing[i].cpu().numpy()
+                            )"""
+
+                    if self.predict_do_shape_deform:
+
+                        action_np = convert_to_numpy(
+                            actions_unsampled[i])
+
+                        deformation_types = [
+                            "lv_dilate",
+                            "myo_erode",
+                            "myo_dilate",
+                            "rv_erode",
+                            "rv_dilate",
+                            "lv_myo_shift",
+                            "rv_myo_shift",
+                        ]
+
+                        for degrad_type in deformation_types:
+
+                            # 1 chance sur 6 comme dans ton code actuel
+                            if random.randint(0, 5) != 0:
+                                continue
+
+                            n_iter = sample_deformation_size()
+
+                            degraded_action = action_np.copy()
+
+                            # -------------------------------------------------------------
+                            # LV
+                            # -------------------------------------------------------------
+
+                            if degrad_type == "lv_dilate":
+
+                                degraded_action = dilate_structure(
+                                    action_np,
+                                    target_label=Label.LV,
+                                    allowed_labels=[Label.MYO],
+                                    n_iter=n_iter,
+                                    local=True,
+                                )
+
+                            # -------------------------------------------------------------
+                            # MYO
+                            # -------------------------------------------------------------
+
+                            elif degrad_type == "myo_erode":
+
+                                degraded_action = erode_structure(
+                                    action_np,
+                                    target_label=Label.MYO,
+                                    replacement_label=Label.BG,
+                                    n_iter=n_iter,
+                                    local=True,
+                                    contact_label=[Label.BG, Label.RV]
+                                )
+
+                            elif degrad_type == "myo_dilate":
+
+                                degraded_action = dilate_structure(
+                                    action_np,
+                                    target_label=Label.MYO,
+                                    allowed_labels=[Label.BG, Label.RV],
+                                    n_iter=n_iter,
+                                    local=True,
+                                )
+
+                            # -------------------------------------------------------------
+                            # RV
+                            # -------------------------------------------------------------
+
+                            elif degrad_type == "rv_erode":
+
+                                degraded_action = erode_structure(
+                                    action_np,
+                                    target_label=Label.RV,
+                                    replacement_label=Label.BG,
+                                    n_iter=n_iter,
+                                    local=True,
+                                    contact_label=[Label.BG, Label.MYO]
+                                )
+
+                            elif degrad_type == "rv_dilate":
+
+                                degraded_action = dilate_structure(
+                                    action_np,
+                                    target_label=Label.RV,
+                                    allowed_labels=[Label.BG, Label.MYO],
+                                    n_iter=n_iter,
+                                    local=True,
+                                )
+
+                            # -------------------------------------------------------------
+                            # Interfaces
+                            # -------------------------------------------------------------
+
+                            elif degrad_type == "lv_myo_shift":
+
+                                degraded_action = shift_interface(
+                                    action_np,
+                                    label_a=Label.LV,
+                                    label_b=Label.MYO,
+                                    n_iter=n_iter,
+                                )
+
+                            elif degrad_type == "rv_myo_shift":
+
+                                degraded_action = shift_interface(
+                                    action_np,
+                                    label_a=Label.RV,
+                                    label_b=Label.MYO,
+                                    n_iter=n_iter,
+                                )
+
+                            # -------------------------------------------------------------
+                            # Save
+                            # -------------------------------------------------------------
+
+                            if not np.array_equal(
+                                    degraded_action,
+                                    action_np,
+                            ):
+                                filename = (
+                                    f"{batch_idx}_{itr}_{i}_"
+                                    f"{degrad_type}_"
+                                    f"{int(round(datetime.now().timestamp()))}.nii.gz"
+                                )
+
+                                save_to_reward_dataset(
+                                    self.predict_save_dir,
+                                    filename,
+                                    convert_to_numpy(b_img[i]),
+                                    np.expand_dims(action_np, 0),
+                                    np.expand_dims(degraded_action, 0),
+                                    voxelspacing[i].cpu().numpy(),
+                                )
+
+                    if self.predict_do_model_perturb:
+                        for j, multiplier in enumerate([0.005, 0.01, 0.015, 0.02]):
+                            # get random seed based on time to maximise randomness of noise and subsequent predictions
+                            # explore as much space around policy as possible
+                            time_seed = int(round(datetime.now().timestamp())) + i
+                            torch.manual_seed(time_seed)
+
+                            # load initial params so noise is not compounded
+                            self.actor.actor.net.load_state_dict(initial_params, strict=True)
+
+                            # add noise to params
+                            with torch.no_grad():
+                                for param in self.actor.actor.net.parameters():
+                                    param.add_(torch.randn(param.size()).cuda() * multiplier)
+
+                            # make prediction
+                            deformed_action, *_ = self.actor.actor(b_img[i].unsqueeze(0))
+                            if len(deformed_action.shape) > 3:
+                                deformed_action = deformed_action.argmax(dim=1)
+                            else:
+                                deformed_action = torch.round(deformed_action)
+
+                            if deformed_action.sum() == 0:
+                                continue
+                            if not np.array_equal(convert_to_numpy(actions_unsampled[i]),
+                                                  convert_to_numpy(deformed_action)):
+                                filename = f"{batch_idx}_{itr}_{i}_{time_seed}.nii.gz"
+                                save_to_reward_dataset(self.predict_save_dir,
+                                                       filename,
+                                                       convert_to_numpy(b_img[i]),
+                                                       np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
+                                                       convert_to_numpy(deformed_action),
+                                                       voxelspacing[i].cpu().numpy())
                         self.actor.actor.net.load_state_dict(initial_params, strict=True)
+                    if self.predict_do_img_perturb:
+                        contrast_factors = [0.8, 0.9]  # [0.7, 0.8]
+                        for factor in contrast_factors:
+                            in_img = b_img[i].unsqueeze(0).clone()
+                            in_img = adjust_contrast(in_img, factor)
+                            # in_img /= in_img.max()
 
-                        # add noise to params
-                        with torch.no_grad():
-                            for param in self.actor.actor.net.parameters():
-                                param.add_(torch.randn(param.size()).cuda() * multiplier)
+                            # make prediction
+                            contr_action, *_ = self.actor.actor(in_img)
+                            if len(contr_action.shape) > 3:
+                                contr_action = contr_action.argmax(dim=1)
+                            else:
+                                contr_action = torch.round(contr_action)
 
-                        # make prediction
-                        deformed_action, *_ = self.actor.actor(b_img[i].unsqueeze(0))
-                        if len(deformed_action.shape) > 3:
-                            deformed_action = deformed_action.argmax(dim=1)
-                        else:
-                            deformed_action = torch.round(deformed_action)
+                            if contr_action.sum() == 0:
+                                continue
 
-                        # f, (ax1, ax2) = plt.subplots(1, 2)
-                        # ax1.set_title(f"Good initial action")
-                        # ax1.imshow(actions_unsampled[i, ...].cpu().numpy().T)
-                        #
-                        # ax2.set_title(f"Deformed network's action")
-                        # ax2.imshow(deformed_action[0, ...].cpu().numpy().T)
-                        # plt.show()
+                            time_seed = int(round(datetime.now().timestamp())) + int(factor * 10)
 
-                        if deformed_action.sum() == 0:
-                            continue
+                            if not np.array_equal(convert_to_numpy(actions_unsampled[i]),
+                                                  convert_to_numpy(contr_action)):
+                                filename = f"{batch_idx}_{itr}_{i}_{time_seed}_contrast.nii.gz"
+                                save_to_reward_dataset(self.predict_save_dir,
+                                                       filename,
+                                                       convert_to_numpy(b_img[i]),
+                                                       np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
+                                                       convert_to_numpy(contr_action),
+                                                       voxelspacing[i].cpu().numpy())
 
-                        filename = f"{batch_idx}_{itr}_{i}_{time_seed}.nii.gz"
+                        gaussian_blurs = [0.05, 0.075, 0.1]  # [0.05, 0.1]
+                        for blur in gaussian_blurs:
+                            in_img = b_img[i].unsqueeze(0).clone()
+                            in_img += torch.randn(in_img.size()).cuda() * blur
+                            in_img /= in_img.max()
+
+                            # make prediction
+                            blurred_action, *_ = self.actor.actor(in_img)
+                            if len(blurred_action.shape) > 3:
+                                blurred_action = blurred_action.argmax(dim=1)
+                            else:
+                                blurred_action = torch.round(blurred_action)
+
+                            # f, (ax1, ax2) = plt.subplots(1, 2)
+                            # ax1.set_title(f"Good action")
+                            # ax1.imshow(actions_unsampled[i, ...].cpu().numpy().T)
+                            #
+                            # ax2.set_title(f"blurred action")
+                            # ax2.imshow(blurred_action[0, ...].cpu().numpy().T)
+                            # plt.show()
+
+                            if blurred_action.sum() == 0:
+                                continue
+
+                            time_seed = int(round(datetime.now().timestamp())) + int(blur * 100)
+                            if not np.array_equal(convert_to_numpy(actions_unsampled[i]),
+                                                  convert_to_numpy(blurred_action)):
+                                filename = f"{batch_idx}_{itr}_{i}_{time_seed}_blur.nii.gz"
+                                save_to_reward_dataset(self.predict_save_dir,
+                                                       filename,
+                                                       convert_to_numpy(b_img[i]),
+                                                       np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
+                                                       convert_to_numpy(blurred_action),
+                                                       voxelspacing[i].cpu().numpy())
+
+                elif self.pred_corrector is not None:
+                    if not corrected_validity[i]:
+                        continue
+
+                    # if ae_comp[i] < 0.85:
+                    #     f, (ax1) = plt.subplots(1)
+                    #     #ax1.set_title(f"Bad initial action")
+                    #     ax1.imshow(actions[i, ...].cpu().numpy().T, cmap='gray')
+                    #     ax1.axis('off')
+                    #     plt.savefig("/data/bad_initial.png", bbox_inches = 'tight', pad_inches = 0)
+                    #
+                    #     f2, (ax2) = plt.subplots(1)
+                    #     # ax2.set_title(f"Corrected action")
+                    #     ax2.imshow(corrected[i, ...].T, cmap='gray')
+                    #     ax2.axis('off')
+                    #     plt.savefig('/data/corrected.png', bbox_inches = 'tight', pad_inches = 0)
+                    #
+                    #     f3, (ax3) = plt.subplots(1)
+                    #     # ax2.set_title(f"Corrected action")
+                    #     ax3.imshow(b_img[i, ...].cpu().numpy().T, cmap='gray')
+                    #     ax3.axis('off')
+                    #     plt.savefig('/data/corr_image.png', bbox_inches = 'tight', pad_inches = 0)
+                    #
+                    #     plt.show()
+                    if self.predict_do_corrections:
+                        filename = f"{batch_idx}_{itr}_{i}_{int(round(datetime.now().timestamp()))}.nii.gz"
                         save_to_reward_dataset(self.predict_save_dir,
                                                filename,
                                                convert_to_numpy(b_img[i]),
-                                               np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
-                                               convert_to_numpy(deformed_action))
-                if self.predict_do_img_perturb:
-                    contrast_factors = [0.7, 0.8]
-                    for factor in contrast_factors:
-                        in_img = b_img[i].unsqueeze(0).clone()
-                        in_img = adjust_contrast(in_img, factor)
-                        #in_img /= in_img.max()
+                                               convert_to_numpy(corrected[i]),
+                                               np.expand_dims(convert_to_numpy(actions[i]), 0),
+                                               voxelspacing[i].cpu().numpy())
+                """else:
+                    slice_id = int(slice[i])
 
-                        # make prediction
-                        contr_action, *_ = self.actor.actor(in_img)
-                        if len(contr_action.shape) > 3:
-                            contr_action = contr_action.argmax(dim=1)
-                        else:
-                            contr_action = torch.round(contr_action)
+                    if slice_id not in self.invalid_segmentation_bank:
+                        self.invalid_segmentation_bank[slice_id] = []
 
-                        # f, (ax1, ax2) = plt.subplots(1, 2)
-                        # ax1.set_title(f"Good action")
-                        # ax1.imshow(actions_unsampled[i, ...].cpu().numpy().T)
-                        #
-                        # ax2.set_title(f"contrast action")
-                        # ax2.imshow(contr_action[0, ...].cpu().numpy().T)
-                        # plt.show()
-
-                        # f, (ax1) = plt.subplots(1)
-                        # # ax1.set_title(f"Bad initial action")
-                        # ax1.imshow(actions_unsampled[i, ...].cpu().numpy().T, cmap='gray')
-                        # ax1.axis('off')
-                        # plt.savefig("/data/good_initial.png", bbox_inches='tight', pad_inches=0)
-                        #
-                        # f2, (ax2) = plt.subplots(1)
-                        # ax2.imshow(contr_action[0, ...].cpu().numpy().T, cmap='gray')
-                        # ax2.axis('off')
-                        # plt.savefig('/data/deformed.png', bbox_inches='tight', pad_inches=0)
-                        #
-                        # f3, (ax3) = plt.subplots(1)
-                        # ax3.imshow(b_img[i, ...].cpu().numpy().T, cmap='gray')
-                        # ax3.axis('off')
-                        # plt.savefig('/data/def_image.png', bbox_inches='tight', pad_inches=0)
-                        #
-                        # f4, (ax4) = plt.subplots(1)
-                        # ax4.axis('off')
-                        # ax4.imshow((actions_unsampled[i] == contr_action[0]).cpu().numpy().T, cmap='gray')
-                        # plt.savefig('/data/def_diff.png', bbox_inches='tight', pad_inches=0)
-                        #
-                        # plt.show()
-
-
-                        if contr_action.sum() == 0:
-                            continue
-
-                        time_seed = int(round(datetime.now().timestamp())) + int(factor*10)
-                        filename = f"{batch_idx}_{itr}_{i}_{time_seed}_contrast.nii.gz"
-                        save_to_reward_dataset(self.predict_save_dir,
-                                               filename,
-                                               convert_to_numpy(b_img[i]),
-                                               np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
-                                               convert_to_numpy(contr_action))
-
-                    gaussian_blurs = [0.05, 0.1]
-                    for blur in gaussian_blurs:
-                        in_img = b_img[i].unsqueeze(0).clone()
-                        in_img += torch.randn(in_img.size()).cuda() * blur
-                        in_img /= in_img.max()
-
-                        # make prediction
-                        blurred_action, *_ = self.actor.actor(in_img)
-                        if len(blurred_action.shape) > 3:
-                            blurred_action = blurred_action.argmax(dim=1)
-                        else:
-                            blurred_action = torch.round(blurred_action)
-
-                        # f, (ax1, ax2) = plt.subplots(1, 2)
-                        # ax1.set_title(f"Good action")
-                        # ax1.imshow(actions_unsampled[i, ...].cpu().numpy().T)
-                        #
-                        # ax2.set_title(f"blurred action")
-                        # ax2.imshow(blurred_action[0, ...].cpu().numpy().T)
-                        # plt.show()
-
-                        if blurred_action.sum() == 0:
-                            continue
-
-                        time_seed = int(round(datetime.now().timestamp())) + int(blur*100)
-                        filename = f"{batch_idx}_{itr}_{i}_{time_seed}_blur.nii.gz"
-                        save_to_reward_dataset(self.predict_save_dir,
-                                               filename,
-                                               convert_to_numpy(b_img[i]),
-                                               np.expand_dims(convert_to_numpy(actions_unsampled[i]), 0),
-                                               convert_to_numpy(blurred_action))
-
-            else:
-                if not corrected_validity[i]:
-                    continue
-
-                # if ae_comp[i] < 0.85:
-                #     f, (ax1) = plt.subplots(1)
-                #     #ax1.set_title(f"Bad initial action")
-                #     ax1.imshow(actions[i, ...].cpu().numpy().T, cmap='gray')
-                #     ax1.axis('off')
-                #     plt.savefig("/data/bad_initial.png", bbox_inches = 'tight', pad_inches = 0)
-                #
-                #     f2, (ax2) = plt.subplots(1)
-                #     # ax2.set_title(f"Corrected action")
-                #     ax2.imshow(corrected[i, ...].T, cmap='gray')
-                #     ax2.axis('off')
-                #     plt.savefig('/data/corrected.png', bbox_inches = 'tight', pad_inches = 0)
-                #
-                #     f3, (ax3) = plt.subplots(1)
-                #     # ax2.set_title(f"Corrected action")
-                #     ax3.imshow(b_img[i, ...].cpu().numpy().T, cmap='gray')
-                #     ax3.axis('off')
-                #     plt.savefig('/data/corr_image.png', bbox_inches = 'tight', pad_inches = 0)
-                #
-                #     plt.show()
-                if self.predict_do_corrections:
-                    filename = f"{batch_idx}_{itr}_{i}_{int(round(datetime.now().timestamp()))}.nii.gz"
-                    save_to_reward_dataset(self.predict_save_dir,
-                                           filename,
-                                           convert_to_numpy(b_img[i]),
-                                           convert_to_numpy(corrected[i]),
-                                           np.expand_dims(convert_to_numpy(actions[i]), 0))
+                    self.invalid_segmentation_bank[slice_id].append({
+                        "action": convert_to_numpy(actions_unsampled[i]).copy(),
+                        "id": ids[i],
+                        "instant": inst[i],
+                    })"""
 
         self.trainer.datamodule.update_dataframe()
         # make sure initial params are back at end of step

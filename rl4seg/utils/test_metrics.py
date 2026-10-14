@@ -5,7 +5,10 @@ from medpy.metric import dc, hd
 from vital.data.config import LabelEnum
 
 
-def dice(pred: np.ndarray, target: np.ndarray, labels: Tuple[LabelEnum], exclude_bg: bool = True,
+def dice(pred: np.ndarray,
+         target: np.ndarray,
+         labels: Tuple[LabelEnum],
+         exclude_bg: bool = True,
          all_classes: bool = False):
     """Compute dice for one sample.
 
@@ -19,28 +22,32 @@ def dice(pred: np.ndarray, target: np.ndarray, labels: Tuple[LabelEnum], exclude
         mean dice
     """
     dices = []
-    if len(labels) > 2:
-        for label in labels:
-            if exclude_bg and label == 0:
-                pass
-            else:
-                pred_mask, gt_mask = np.isin(pred, label), np.isin(target, label)
-                dices.append(dc(pred_mask, gt_mask))
+    dice_dict = {}
+
+    for label in labels:
+        if exclude_bg and label == 0:
+            continue
+
+        pred_mask = np.isin(pred, label)
+        gt_mask = np.isin(target, label)
+
+        d = dc(pred_mask, gt_mask)
+        dices.append(d)
+
         if all_classes:
-            dice_dict = {f"dice_{label.name}": dice for label, dice in zip(labels[1:], dices)}
-            dice_dict['Dice'] = np.array(dices).mean()
-            return dice_dict
-        else:
-            return np.array(dices).mean()
-    else:
-        if all_classes:
-            return {'Dice': dc(pred.squeeze(), target.squeeze())}
-        else:
-            return dc(pred.squeeze(), target.squeeze())
+            dice_dict[f"dice_{label.name}"] = d
+
+    mean_dice = np.mean(dices)
+
+    if all_classes:
+        dice_dict["Dice"] = mean_dice
+        return dice_dict
+
+    return mean_dice
 
 
 def hausdorff(pred: np.ndarray, target: np.ndarray, labels: Tuple[LabelEnum], exclude_bg: bool = True,
-         all_classes: bool = False, voxel_spacing: Tuple[float] = None):
+              all_classes: bool = False, voxel_spacing: Tuple[float] = None):
     """Compute hausdorff for one sample.
 
     Args:
@@ -52,22 +59,55 @@ def hausdorff(pred: np.ndarray, target: np.ndarray, labels: Tuple[LabelEnum], ex
     Returns:
         hausdorff
     """
-    hd_dict = {}
+    raw_values = {}  # clé -> liste de valeurs (potentiellement nan) sur tous les samples
+
     for i in range(len(pred)):
         hausdorffs = []
+
         for label in labels:
             if exclude_bg and label == 0:
-                pass
+                continue
+
+            pred_mask = pred[i] == label
+            gt_mask = target[i] == label
+
+            pred_empty = not np.any(pred_mask)
+            gt_empty = not np.any(gt_mask)
+
+            if pred_empty and gt_empty:
+                haus = 0.0
+            elif pred_empty or gt_empty:
+                haus = np.nan
             else:
-                pred_mask, gt_mask = np.isin(pred[i], label), np.isin(target[i], label)
-                if pred_mask.sum() == 0:
-                    pred_mask[0, 0] = True
-                    print('empty mask')
-                hausdorffs.append(hd(pred_mask, gt_mask, voxel_spacing[i] if voxel_spacing is not None else None))
+                haus = hd(
+                    pred_mask,
+                    gt_mask,
+                    voxel_spacing[i] if voxel_spacing is not None else None
+                )
+
+            hausdorffs.append((label, haus))
+
+        if not hausdorffs:
+            continue
+
         if all_classes:
-            for label, haus in zip(labels[1:], hausdorffs):
-                hd_dict[f"hd_{label.name}"] = hd_dict.get(f"hd_{label.name}", 0) + haus / len(pred)
-            hd_dict['Hausdorff'] = hd_dict.get('Hausdorff', 0) + np.array(hausdorffs).mean() / len(pred)
+            for label, haus in hausdorffs:
+                key = f"hd_{label.name}"
+                raw_values.setdefault(key, []).append(haus)
+
+        hd_values = [haus for _, haus in hausdorffs]
+        if all(np.isnan(hd_values)):
+            sample_hd = np.nan
         else:
-            hd_dict['Hausdorff'] = hd_dict.get('Hausdorff', 0) + np.array(hausdorffs).mean() / len(pred)
+            sample_hd = np.nanmean(hd_values)
+        raw_values.setdefault('Hausdorff', []).append(sample_hd)
+
+    # Agrégation finale, nan-safe, une seule fois
+    hd_dict = {}
+    for key, values in raw_values.items():
+        if all(np.isnan(v) for v in values):
+            hd_dict[key] = np.nan
+        else:
+            hd_dict[key] = np.nanmean(values)
+
     return hd_dict

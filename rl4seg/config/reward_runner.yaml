@@ -2,7 +2,7 @@ work_dir: ${hydra:runtime.cwd}
 run_name: rewardnet
 
 defaults:
-  - logger: tensorboard
+  - logger: comet
   - model: rewardnet
   - datamodule: rewardnet_diff
   - callbacks: default
@@ -15,8 +15,8 @@ logger:
 
 callbacks:
   model_checkpoint:
-    monitor: val_loss
-    mode: min
+    monitor: val_rec
+    mode: max
 
 run_predict: False
 

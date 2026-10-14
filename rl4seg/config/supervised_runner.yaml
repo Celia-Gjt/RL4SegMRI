@@ -2,12 +2,12 @@ work_dir: ${hydra:runtime.cwd}
 run_name: supervised_default
 
 defaults:
-  - logger: tensorboard
+  - logger: comet
   - model: supervised
   - datamodule: ???
   - callbacks: default
   - _self_
-  - experiment: supervised_es_ed
+  - experiment: supervised_pepr_aphm_cine
 
 seed: 1
 

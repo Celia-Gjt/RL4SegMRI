@@ -1,17 +1,17 @@
 
 num_iter: 4
-run_name: run_1_shrinkperturb
+run_name: run_pepr_aphm_cine_to_pepr_cine
 output_path: ${oc.env:LOG_PATH}/${run_name}/
 
 var_file: ${output_path}/variables.pkl
 
-target: es_ed
-source: camus
+target: pepr_cine
+source: pepr_aphm_cine_train
 
 #
 # supervised params
 #
-sup_num_epochs: 50
+sup_num_epochs: 300
 
 # Increases randomness in initial model
 sup_loss_label_smoothing: 0.0
@@ -22,6 +22,8 @@ sup_loss_label_smoothing: 0.0
 rl_num_epochs: 5
 rl_num_predict: 2500
 rl_overrides: []
+
+split: 0
 
 #
 # RewardNet params

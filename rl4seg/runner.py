@@ -35,8 +35,11 @@ def main(cfg):
     if cfg.train:
         trainer.fit(train_dataloaders=datamodule, model=model)
 
-    if cfg.trainer.max_epochs > 0:
+    if cfg.trainer.max_epochs > 0 and cfg.train:
         ckpt_path = 'best'
+        
+    elif getattr(cfg, "test_from_ckpt", None):
+        ckpt_path = cfg.test_from_ckpt
     else:
         ckpt_path = None
 

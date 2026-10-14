@@ -1,5 +1,5 @@
 import torch
-from torchmetrics.functional import dice
+from torchmetrics.functional.segmentation import dice
 
 from vital.models.segmentation.unet import UNet
 
