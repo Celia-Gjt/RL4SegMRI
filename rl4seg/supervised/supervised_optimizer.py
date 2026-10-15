@@ -88,7 +88,7 @@ class SupervisedOptimizer(pl.LightningModule):
         pred_show = y_pred[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
         log_case(self.logger, img=[im_show, gt_show, pred_show], title='Figure_supervised',
                  number=batch_idx * (idx + 1),
-                 img_text=simple_dice[idx].mean())
+                 img_text=dice[idx].mean())
 
         self.log_dict(logs, batch_size=b_img.shape[0])
         return logs
@@ -123,7 +123,7 @@ class SupervisedOptimizer(pl.LightningModule):
         logs.update(test_dice)
         logs.update(test_hd)
 
-        for i in range(len(x)):
+        for i in range(len(b_img)):
             im_show = b_img[i].permute((0, 2, 1)).detach().cpu().numpy()
             gt_show = b_gt[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
             pred_show = y_pred[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
