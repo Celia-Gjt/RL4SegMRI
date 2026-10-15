@@ -14,7 +14,7 @@ from vital.data.pepr.config import Label
 
 from rl4seg.utils.Metrics import accuracy, dice_score, is_anatomically_valid_mri
 from rl4seg.utils.file_utils import save_to_reward_dataset
-from rl4seg.utils.logging_helper import log_image
+from rl4seg.utils.logging_helper import log_case
 from rl4seg.utils.tensor_utils import convert_to_numpy
 from rl4seg.utils.test_metrics import dice, hausdorff
 
@@ -84,8 +84,8 @@ class SupervisedOptimizer(pl.LightningModule):
         idx = random.randint(0, len(b_img) - 1)  # which image to log
 
         im_show = b_img[idx].permute((0, 2, 1)).detach().cpu().numpy()
-        gt_show = b_gt[idx].permute((0, 2, 1)).detach().cpu().numpy()
-        pred_show = y_pred[idx].permute((0, 2, 1)).detach().cpu().numpy()
+        gt_show = b_gt[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+        pred_show = y_pred[idx].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
         log_case(self.logger, img=[im_show, gt_show, pred_show], title='Figure_supervised',
                  number=batch_idx * (idx + 1),
                  img_text=simple_dice[idx].mean())
@@ -125,8 +125,8 @@ class SupervisedOptimizer(pl.LightningModule):
 
         for i in range(len(x)):
             im_show = b_img[i].permute((0, 2, 1)).detach().cpu().numpy()
-            gt_show = b_gt[i].permute((0, 2, 1)).detach().cpu().numpy()
-            pred_show = y_pred[i].permute((0, 2, 1)).detach().cpu().numpy()
+            gt_show = b_gt[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
+            pred_show = y_pred[i].unsqueeze(0).permute((0, 2, 1)).detach().cpu().numpy()
             log_case(self.logger, img=[im_show,gt_show,pred_show], title='test_Figure_supervised', number=batch_idx * (i + 1),
                       img_text=simple_dice[i].mean())
 
