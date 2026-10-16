@@ -115,7 +115,7 @@ def main(cfg):
             overrides += [
                 f"model.actor.critic.pretrain_ckpt={output_path}/{i - 1}/critic.ckpt"]
         sub_cfg = compose(config_name=f"RL_runner.yaml", overrides=overrides)
-        # print(OmegaConf.to_yaml(sub_cfg))
+        print(OmegaConf.to_yaml(sub_cfg))
         runner_main(sub_cfg)
 
 if __name__ == '__main__':
