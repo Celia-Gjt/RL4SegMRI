@@ -1,0 +1,9 @@
+_target_: datamodules.PEPR_RL_datamodule.PEPRDataModule
+
+data_dir: ${oc.env:DATA_PATH}/pepr_cine_train/
+csv_file: 'pepr'
+
+subset_frac: 1.0
+gt_frac: 0.0
+approx_gt_dir: null #${logger.offline_directory}
+splits_column: split_0

@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - override /model: ppo
+  - override /datamodule: pepr_cine
+  - override /actor/actor@model.actor.actor: categorical_unet_actor
+#  - override /reward@model.reward: pixelwise_accuracy # uncomment here to have 'supervised' RL
+
+model:
+  actor:
+    actor:
+      input_shape: [1, 256, 256]
+      output_shape: [4, 256, 256]
+
+datamodule:
+  supervised: False # 'set this to True for supervised RL'
+
+run_name: pepr

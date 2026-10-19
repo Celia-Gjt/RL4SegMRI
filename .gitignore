@@ -1,0 +1,14 @@
+*.pyc
+# Project specific
+*.pth
+*.nii.gz
+*.nii
+*.npy
+*.npz
+*.csv
+*.log
+*.png
+
+logs_rl
+logs/
+.env
